@@ -7,7 +7,9 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
+#include <condition_variable>
 #include <cstring>
+#include <mutex>
 
 #include "db/db_test_util.h"
 #include "options/options_helper.h"
@@ -1204,7 +1206,8 @@ TEST_P(DBMultiGetTestWithParam, MultiGetMultiCF) {
             auto* cfd = static_cast_with_check<ColumnFamilyHandleImpl>(
                             db->GetColumnFamilyHandle(i))
                             ->cfd();
-            ASSERT_EQ(cfd->TEST_GetLocalSV()->Get(), SuperVersion::kSVInUse);
+            ASSERT_TRUE(cfd->TEST_HasThreadLocalSuperVersion());
+            ASSERT_TRUE(cfd->TEST_ThreadLocalSuperVersionIsCurrent());
           }
         }
       });
@@ -1256,8 +1259,8 @@ TEST_P(DBMultiGetTestWithParam, MultiGetMultiCF) {
         static_cast_with_check<ColumnFamilyHandleImpl>(
             static_cast_with_check<DBImpl>(db_)->GetColumnFamilyHandle(cf))
             ->cfd();
-    ASSERT_NE(cfd->TEST_GetLocalSV()->Get(), SuperVersion::kSVInUse);
-    ASSERT_NE(cfd->TEST_GetLocalSV()->Get(), SuperVersion::kSVObsolete);
+    ASSERT_TRUE(cfd->TEST_HasThreadLocalSuperVersion());
+    ASSERT_TRUE(cfd->TEST_ThreadLocalSuperVersionIsCurrent());
   }
 }
 
@@ -1319,7 +1322,9 @@ TEST_P(DBMultiGetTestWithParam, MultiGetMultiCFMutex) {
         static_cast_with_check<ColumnFamilyHandleImpl>(
             static_cast_with_check<DBImpl>(db_)->GetColumnFamilyHandle(i))
             ->cfd();
-    ASSERT_NE(cfd->TEST_GetLocalSV()->Get(), SuperVersion::kSVInUse);
+    if (cfd->TEST_HasThreadLocalSuperVersion()) {
+      ASSERT_TRUE(cfd->TEST_ThreadLocalSuperVersionIsCurrent());
+    }
   }
 }
 
@@ -1350,9 +1355,8 @@ TEST_P(DBMultiGetTestWithParam, MultiGetMultiCFSnapshot) {
             auto* cfd = static_cast_with_check<ColumnFamilyHandleImpl>(
                             db->GetColumnFamilyHandle(i))
                             ->cfd();
-            ASSERT_TRUE(
-                (cfd->TEST_GetLocalSV()->Get() == SuperVersion::kSVInUse) ||
-                (cfd->TEST_GetLocalSV()->Get() == SuperVersion::kSVObsolete));
+            ASSERT_TRUE(cfd->TEST_HasThreadLocalSuperVersion());
+            ASSERT_TRUE(cfd->TEST_ThreadLocalSuperVersionIsCurrent());
           }
         }
       });
@@ -1379,7 +1383,8 @@ TEST_P(DBMultiGetTestWithParam, MultiGetMultiCFSnapshot) {
         static_cast_with_check<ColumnFamilyHandleImpl>(
             static_cast_with_check<DBImpl>(db_)->GetColumnFamilyHandle(i))
             ->cfd();
-    ASSERT_NE(cfd->TEST_GetLocalSV()->Get(), SuperVersion::kSVInUse);
+    ASSERT_TRUE(cfd->TEST_HasThreadLocalSuperVersion());
+    ASSERT_TRUE(cfd->TEST_ThreadLocalSuperVersionIsCurrent());
   }
 }
 
@@ -1403,6 +1408,150 @@ TEST_P(DBMultiGetTestWithParam, MultiGetMultiCFUnsorted) {
   ASSERT_EQ(values[0], "bar");
   ASSERT_EQ(values[1], "xyz");
   ASSERT_EQ(values[2], "def");
+}
+
+TEST_F(DBBasicTest, SuperVersionReentrantSameVersion) {
+  CreateAndReopenWithCF({"pikachu"}, CurrentOptions());
+
+  auto* db = static_cast_with_check<DBImpl>(db_);
+  auto* cfd = static_cast_with_check<ColumnFamilyHandleImpl>(
+                  db->GetColumnFamilyHandle(0))
+                  ->cfd();
+
+  SuperVersion* outer = db->GetAndRefSuperVersion(cfd);
+  SuperVersion* inner = db->GetAndRefSuperVersion(cfd);
+
+  ASSERT_EQ(outer->version_number, inner->version_number);
+
+  db->ReturnAndCleanupSuperVersion(cfd, outer);
+  ASSERT_EQ(inner->version_number,
+            cfd->TEST_GetThreadLocalSuperVersionVersionNumber());
+
+  SuperVersion* again = db->GetAndRefSuperVersion(cfd);
+  ASSERT_EQ(inner->version_number, again->version_number);
+
+  db->ReturnAndCleanupSuperVersion(cfd, again);
+  db->ReturnAndCleanupSuperVersion(cfd, inner);
+
+  ASSERT_TRUE(cfd->TEST_HasThreadLocalSuperVersion());
+  ASSERT_TRUE(cfd->TEST_ThreadLocalSuperVersionIsCurrent());
+}
+
+TEST_F(DBBasicTest, SuperVersionReentrantSeesLatestAfterPublish) {
+  CreateAndReopenWithCF({"pikachu"}, CurrentOptions());
+  ASSERT_OK(Put("k", "v1"));
+
+  auto* db = static_cast_with_check<DBImpl>(db_);
+  auto* cfd = static_cast_with_check<ColumnFamilyHandleImpl>(
+                  db->GetColumnFamilyHandle(0))
+                  ->cfd();
+
+  SuperVersion* outer = db->GetAndRefSuperVersion(cfd);
+  const uint64_t outer_version = outer->version_number;
+
+  Status publish_status;
+  std::thread publisher([&]() {
+    publish_status = Put("k", "v2");
+    if (publish_status.ok()) {
+      publish_status = Flush();
+    }
+  });
+  publisher.join();
+  ASSERT_OK(publish_status);
+
+  ASSERT_GT(cfd->GetSuperVersionNumber(), outer_version);
+
+  SuperVersion* inner = db->GetAndRefSuperVersion(cfd);
+  ASSERT_GT(inner->version_number, outer_version);
+
+  db->ReturnAndCleanupSuperVersion(cfd, outer);
+  ASSERT_EQ(inner->version_number,
+            cfd->TEST_GetThreadLocalSuperVersionVersionNumber());
+
+  SuperVersion* latest = db->GetAndRefSuperVersion(cfd);
+  ASSERT_EQ(inner->version_number, latest->version_number);
+
+  db->ReturnAndCleanupSuperVersion(cfd, latest);
+  db->ReturnAndCleanupSuperVersion(cfd, inner);
+
+  ASSERT_TRUE(cfd->TEST_HasThreadLocalSuperVersion());
+  ASSERT_TRUE(cfd->TEST_ThreadLocalSuperVersionIsCurrent());
+}
+
+TEST_F(DBBasicTest, SuperVersionReentrantRaceWithPublishKeepsLatestCache) {
+  CreateAndReopenWithCF({"pikachu"}, CurrentOptions());
+  ASSERT_OK(Put("k", "v1"));
+
+  auto* db = static_cast_with_check<DBImpl>(db_);
+  auto* cfd = static_cast_with_check<ColumnFamilyHandleImpl>(
+                  db->GetColumnFamilyHandle(0))
+                  ->cfd();
+
+  SuperVersion* outer = db->GetAndRefSuperVersion(cfd);
+  const uint64_t outer_version = outer->version_number;
+
+  std::mutex mu;
+  std::condition_variable cv;
+  bool inner_paused = false;
+  bool allow_inner_to_finish = false;
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  SyncPoint::GetInstance()->SetCallBack(
+      "ColumnFamilyData::GetThreadLocalSuperVersion:BeforeTryRestore",
+      [&](void* /*arg*/) {
+        std::unique_lock<std::mutex> lock(mu);
+        inner_paused = true;
+        cv.notify_all();
+        cv.wait(lock, [&] { return allow_inner_to_finish; });
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  Status publish_status;
+  std::thread publisher([&]() {
+    {
+      std::unique_lock<std::mutex> lock(mu);
+      cv.wait(lock, [&] { return inner_paused; });
+    }
+    publish_status = Put("k", "v2");
+    if (publish_status.ok()) {
+      publish_status = Flush();
+    }
+    {
+      std::lock_guard<std::mutex> lock(mu);
+      allow_inner_to_finish = true;
+    }
+    cv.notify_all();
+  });
+
+  SuperVersion* inner = db->GetAndRefSuperVersion(cfd);
+  publisher.join();
+  ASSERT_OK(publish_status);
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  ASSERT_EQ(inner->version_number, outer_version);
+  ASSERT_GT(cfd->GetSuperVersionNumber(), outer_version);
+  ASSERT_TRUE(cfd->TEST_HasThreadLocalSuperVersion());
+  ASSERT_TRUE(cfd->TEST_ThreadLocalSuperVersionIsCurrent());
+  ASSERT_GT(cfd->TEST_GetThreadLocalSuperVersionVersionNumber(),
+            outer_version);
+
+  SuperVersion* latest = db->GetAndRefSuperVersion(cfd);
+  ASSERT_GT(latest->version_number, outer_version);
+  ASSERT_EQ(latest->version_number,
+            cfd->TEST_GetThreadLocalSuperVersionVersionNumber());
+
+  db->ReturnAndCleanupSuperVersion(cfd, outer);
+  ASSERT_EQ(latest->version_number,
+            cfd->TEST_GetThreadLocalSuperVersionVersionNumber());
+
+  db->ReturnAndCleanupSuperVersion(cfd, latest);
+  db->ReturnAndCleanupSuperVersion(cfd, inner);
+
+  ASSERT_TRUE(cfd->TEST_HasThreadLocalSuperVersion());
+  ASSERT_TRUE(cfd->TEST_ThreadLocalSuperVersionIsCurrent());
 }
 
 INSTANTIATE_TEST_CASE_P(DBMultiGetTestWithParam, DBMultiGetTestWithParam,

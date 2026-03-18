@@ -434,12 +434,11 @@ class ColumnFamilyData {
   // Return a already referenced SuperVersion to be used safely.
   SuperVersion* GetReferencedSuperVersion(DBImpl* db);
   // thread-safe
-  // Get SuperVersion stored in thread local storage. If it does not exist,
-  // get a reference from a current SuperVersion.
+  // Get a referenced SuperVersion using the thread-local cache when possible.
   SuperVersion* GetThreadLocalSuperVersion(DBImpl* db);
-  // Try to return SuperVersion back to thread local storage. Return true on
-  // success and false on failure. It fails when the thread local storage
-  // contains anything other than SuperVersion::kSVInUse flag.
+  // Try to transfer a referenced SuperVersion into thread-local cache.
+  // Returns true when ownership is transferred and false when the caller
+  // should release it normally.
   bool ReturnThreadLocalSuperVersion(SuperVersion* sv);
   // thread-safe
   uint64_t GetSuperVersionNumber() const {
@@ -517,6 +516,9 @@ class ColumnFamilyData {
   }
 
   ThreadLocalPtr* TEST_GetLocalSV() { return local_sv_.get(); }
+  bool TEST_HasThreadLocalSuperVersion();
+  bool TEST_ThreadLocalSuperVersionIsCurrent();
+  uint64_t TEST_GetThreadLocalSuperVersionVersionNumber();
   WriteBufferManager* write_buffer_mgr() { return write_buffer_manager_; }
 
   static const uint32_t kDummyColumnFamilyDataId;
@@ -570,7 +572,7 @@ class ColumnFamilyData {
   // changes.
   std::atomic<uint64_t> super_version_number_;
 
-  // Thread's local copy of SuperVersion pointer
+  // Thread-local cache state for the latest SuperVersion seen on a thread.
   // This needs to be destructed before mutex_
   std::unique_ptr<ThreadLocalPtr> local_sv_;
 

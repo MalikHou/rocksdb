@@ -36,6 +36,7 @@
 #include "rocksdb/convenience.h"
 #include "rocksdb/table.h"
 #include "table/merging_iterator.h"
+#include "test_util/sync_point.h"
 #include "util/autovector.h"
 #include "util/cast_util.h"
 #include "util/compression.h"
@@ -476,19 +477,65 @@ void SuperVersion::Init(ColumnFamilyData* new_cfd, MemTable* new_mem,
 }
 
 namespace {
-void SuperVersionUnrefHandle(void* ptr) {
-  // UnrefHandle is called when a thread exits or a ThreadLocalPtr gets
-  // destroyed. When the former happens, the thread shouldn't see kSVInUse.
-  // When the latter happens, only super_version_ holds a reference
-  // to ColumnFamilyData, so no further queries are possible.
-  SuperVersion* sv = static_cast<SuperVersion*>(ptr);
-  bool was_last_ref __attribute__((__unused__));
-  was_last_ref = sv->Unref();
-  // Thread-local SuperVersions can't outlive ColumnFamilyData::super_version_.
-  // This is important because we can't do SuperVersion cleanup here.
-  // That would require locking DB mutex, which would deadlock because
-  // SuperVersionUnrefHandle is called with locked ThreadLocalPtr mutex.
-  assert(!was_last_ref);
+struct LocalSuperVersion {
+  std::atomic<void*> cached_sv;
+
+  LocalSuperVersion() : cached_sv(nullptr) {}
+};
+
+LocalSuperVersion* GetOrCreateLocalSuperVersion(ThreadLocalPtr* local_sv) {
+  auto* cache = static_cast<LocalSuperVersion*>(local_sv->Get());
+  if (cache == nullptr) {
+    cache = new LocalSuperVersion();
+    local_sv->Reset(cache);
+  }
+  return cache;
+}
+
+SuperVersion* GetCachedSuperVersion(LocalSuperVersion* cache) {
+  if (cache == nullptr) {
+    return nullptr;
+  }
+  void* raw = cache->cached_sv.load(std::memory_order_acquire);
+  if (raw == nullptr || raw == SuperVersion::kSVInUse) {
+    return nullptr;
+  }
+  return static_cast<SuperVersion*>(raw);
+}
+
+void LocalSuperVersionUnrefHandle(void* ptr) {
+  auto* cache = static_cast<LocalSuperVersion*>(ptr);
+  void* raw = cache->cached_sv.exchange(nullptr, std::memory_order_acquire);
+  assert(raw != SuperVersion::kSVInUse);
+  if (raw != nullptr && raw != SuperVersion::kSVInUse) {
+    SuperVersion* sv = static_cast<SuperVersion*>(raw);
+    bool was_last_ref __attribute__((__unused__));
+    was_last_ref = sv->Unref();
+    // Thread-local caches can't outlive ColumnFamilyData::super_version_.
+    // We cannot do full cleanup here because ThreadLocalPtr holds a global
+    // mutex while invoking handlers.
+    assert(!was_last_ref);
+  }
+  delete cache;
+}
+
+struct ResetThreadLocalSuperVersionsContext {
+  explicit ResetThreadLocalSuperVersionsContext(SuperVersion* new_sv)
+      : new_superversion(new_sv) {}
+
+  SuperVersion* new_superversion;
+  autovector<SuperVersion*> old_superversions;
+};
+
+void RefreshThreadLocalSuperVersionCache(void* ptr, void* arg) {
+  auto* cache = static_cast<LocalSuperVersion*>(ptr);
+  auto* ctx = static_cast<ResetThreadLocalSuperVersionsContext*>(arg);
+  void* old =
+      cache->cached_sv.exchange(ctx->new_superversion->Ref(),
+                                std::memory_order_acq_rel);
+  if (old != nullptr && old != SuperVersion::kSVInUse) {
+    ctx->old_superversions.push_back(static_cast<SuperVersion*>(old));
+  }
 }
 }  // anonymous namespace
 
@@ -531,7 +578,7 @@ ColumnFamilyData::ColumnFamilyData(
            ioptions_.max_write_buffer_size_to_maintain),
       super_version_(nullptr),
       super_version_number_(0),
-      local_sv_(new ThreadLocalPtr(&SuperVersionUnrefHandle)),
+      local_sv_(new ThreadLocalPtr(&LocalSuperVersionUnrefHandle)),
       next_(nullptr),
       prev_(nullptr),
       log_number_(0),
@@ -1177,83 +1224,66 @@ Compaction* ColumnFamilyData::CompactRange(
 }
 
 SuperVersion* ColumnFamilyData::GetReferencedSuperVersion(DBImpl* db) {
-  SuperVersion* sv = GetThreadLocalSuperVersion(db);
-  sv->Ref();
-  if (!ReturnThreadLocalSuperVersion(sv)) {
-    // This Unref() corresponds to the Ref() in GetThreadLocalSuperVersion()
-    // when the thread-local pointer was populated. So, the Ref() earlier in
-    // this function still prevents the returned SuperVersion* from being
-    // deleted out from under the caller.
-    sv->Unref();
-  }
-  return sv;
+  return GetThreadLocalSuperVersion(db);
 }
 
 SuperVersion* ColumnFamilyData::GetThreadLocalSuperVersion(DBImpl* db) {
-  // The SuperVersion is cached in thread local storage to avoid acquiring
-  // mutex when SuperVersion does not change since the last use. When a new
-  // SuperVersion is installed, the compaction or flush thread cleans up
-  // cached SuperVersion in all existing thread local storage. To avoid
-  // acquiring mutex for this operation, we use atomic Swap() on the thread
-  // local pointer to guarantee exclusive access. If the thread local pointer
-  // is being used while a new SuperVersion is installed, the cached
-  // SuperVersion can become stale. In that case, the background thread would
-  // have swapped in kSVObsolete. We re-check the value at when returning
-  // SuperVersion back to thread local, with an atomic compare and swap.
-  // The superversion will need to be released if detected to be stale.
-  void* ptr = local_sv_->Swap(SuperVersion::kSVInUse);
-  // Invariant:
-  // (1) Scrape (always) installs kSVObsolete in ThreadLocal storage
-  // (2) the Swap above (always) installs kSVInUse, ThreadLocal storage
-  // should only keep kSVInUse before ReturnThreadLocalSuperVersion call
-  // (if no Scrape happens).
-  assert(ptr != SuperVersion::kSVInUse);
-  SuperVersion* sv = static_cast<SuperVersion*>(ptr);
-  if (sv == SuperVersion::kSVObsolete ||
-      sv->version_number != super_version_number_.load()) {
+  auto* cache = GetOrCreateLocalSuperVersion(local_sv_.get());
+  const uint64_t current_sv_number =
+      super_version_number_.load(std::memory_order_acquire);
+  void* raw =
+      cache->cached_sv.exchange(SuperVersion::kSVInUse,
+                                std::memory_order_acquire);
+  assert(raw != SuperVersion::kSVInUse);
+
+  SuperVersion* cached_sv =
+      raw == nullptr || raw == SuperVersion::kSVInUse
+          ? nullptr
+          : static_cast<SuperVersion*>(raw);
+  SuperVersion* result = nullptr;
+  SuperVersion* cache_sv = nullptr;
+
+  if (cached_sv != nullptr && cached_sv->version_number == current_sv_number) {
+    result = cached_sv->Ref();
+    cache_sv = cached_sv;
+  } else {
     RecordTick(ioptions_.stats, NUMBER_SUPERVERSION_ACQUIRES);
-    SuperVersion* sv_to_delete = nullptr;
-
-    if (sv && sv->Unref()) {
-      RecordTick(ioptions_.stats, NUMBER_SUPERVERSION_CLEANUPS);
-      db->mutex()->Lock();
-      // NOTE: underlying resources held by superversion (sst files) might
-      // not be released until the next background job.
-      sv->Cleanup();
-      if (db->immutable_db_options().avoid_unnecessary_blocking_io) {
-        db->AddSuperVersionsToFreeQueue(sv);
-        db->SchedulePurge();
-      } else {
-        sv_to_delete = sv;
-      }
-    } else {
-      db->mutex()->Lock();
+    if (cached_sv != nullptr) {
+      db->CleanupSuperVersion(cached_sv);
     }
-    sv = super_version_->Ref();
+    db->mutex()->Lock();
+    result = super_version_->Ref();
+    cache_sv = super_version_->Ref();
     db->mutex()->Unlock();
-
-    delete sv_to_delete;
   }
-  assert(sv != nullptr);
-  return sv;
+
+  TEST_SYNC_POINT("ColumnFamilyData::GetThreadLocalSuperVersion:"
+                  "BeforeTryRestore");
+  void* expected = SuperVersion::kSVInUse;
+  if (!cache->cached_sv.compare_exchange_strong(expected, cache_sv,
+                                                std::memory_order_release,
+                                                std::memory_order_relaxed)) {
+    db->CleanupSuperVersion(cache_sv);
+  }
+
+  assert(result != nullptr);
+  return result;
 }
 
 bool ColumnFamilyData::ReturnThreadLocalSuperVersion(SuperVersion* sv) {
   assert(sv != nullptr);
-  // Put the SuperVersion back
-  void* expected = SuperVersion::kSVInUse;
-  if (local_sv_->CompareAndSwap(static_cast<void*>(sv), expected)) {
-    // When we see kSVInUse in the ThreadLocal, we are sure ThreadLocal
-    // storage has not been altered and no Scrape has happened. The
-    // SuperVersion is still current.
-    return true;
-  } else {
-    // ThreadLocal scrape happened in the process of this GetImpl call (after
-    // thread local Swap() at the beginning and before CompareAndSwap()).
-    // This means the SuperVersion it holds is obsolete.
-    assert(expected == SuperVersion::kSVObsolete);
+  auto* cache = static_cast<LocalSuperVersion*>(local_sv_->Get());
+  if (cache == nullptr) {
+    return false;
   }
-  return false;
+  if (sv->version_number != super_version_number_.load(std::memory_order_acquire)) {
+    return false;
+  }
+
+  void* expected = nullptr;
+  return cache->cached_sv.compare_exchange_strong(expected, sv,
+                                                  std::memory_order_release,
+                                                  std::memory_order_relaxed);
 }
 
 void ColumnFamilyData::InstallSuperVersion(
@@ -1300,14 +1330,9 @@ void ColumnFamilyData::InstallSuperVersion(
 }
 
 void ColumnFamilyData::ResetThreadLocalSuperVersions() {
-  autovector<void*> sv_ptrs;
-  local_sv_->Scrape(&sv_ptrs, SuperVersion::kSVObsolete);
-  for (auto ptr : sv_ptrs) {
-    assert(ptr);
-    if (ptr == SuperVersion::kSVInUse) {
-      continue;
-    }
-    auto sv = static_cast<SuperVersion*>(ptr);
+  ResetThreadLocalSuperVersionsContext ctx(super_version_);
+  local_sv_->Fold(RefreshThreadLocalSuperVersionCache, &ctx);
+  for (auto* sv : ctx.old_superversions) {
     bool was_last_ref __attribute__((__unused__));
     was_last_ref = sv->Unref();
     // sv couldn't have been the last reference because
@@ -1315,6 +1340,27 @@ void ColumnFamilyData::ResetThreadLocalSuperVersions() {
     // unref'ing super_version_.
     assert(!was_last_ref);
   }
+}
+
+bool ColumnFamilyData::TEST_HasThreadLocalSuperVersion() {
+  return GetCachedSuperVersion(
+             static_cast<LocalSuperVersion*>(local_sv_->Get())) != nullptr;
+}
+
+bool ColumnFamilyData::TEST_ThreadLocalSuperVersionIsCurrent() {
+  auto* sv =
+      GetCachedSuperVersion(static_cast<LocalSuperVersion*>(local_sv_->Get()));
+  return sv != nullptr &&
+         sv->version_number == super_version_number_.load(std::memory_order_acquire);
+}
+
+uint64_t ColumnFamilyData::TEST_GetThreadLocalSuperVersionVersionNumber() {
+  auto* sv =
+      GetCachedSuperVersion(static_cast<LocalSuperVersion*>(local_sv_->Get()));
+  if (sv == nullptr) {
+    return 0;
+  }
+  return sv->version_number;
 }
 
 Status ColumnFamilyData::ValidateOptions(
